@@ -78,7 +78,7 @@ def list_devices():
 def _fetch_location(device_id, timeout=15):
     result = None
     request_uuid = generate_random_uuid()
-    done = threading.Event()  # ← threading.Event, non asyncio
+    done = threading.Event()
 
     def handler(resp_hex):
         nonlocal result
@@ -88,14 +88,24 @@ def _fetch_location(device_id, timeout=15):
             done.set()
 
     with _fetch_location_lock:
-        fcm_token = FcmReceiver().register_for_location_updates(handler)
+        receiver = FcmReceiver()
+        # Clear any stale callbacks from previous calls (e.g. timed-out fetches)
+        # before registering the new handler for this request.
+        receiver.location_update_callbacks.clear()
         try:
+            fcm_token = receiver.register_for_location_updates(handler)
             payload = create_location_request(device_id, fcm_token, request_uuid)
             nova_request(NOVA_ACTION_API_SCOPE, payload)
             got_response = done.wait(timeout)
             print(f"[FetchLocation] device={device_id} got_response={got_response} result={'yes' if result else 'no'}")
         finally:
-            FcmReceiver().stop_listening()
+            # Remove only this call's handler — do NOT call stop_listening().
+            # The FCM listener is a singleton and must stay alive across fetches
+            # to avoid creating new asyncio event loops and leaking file descriptors.
+            try:
+                receiver.location_update_callbacks.remove(handler)
+            except ValueError:
+                pass
 
     locations = extract_locations(result) if result else []
     return locations if locations is not None else []
@@ -127,7 +137,7 @@ def _upload_location(device_id, location):
     }
     print(f"[UploadLocation] Sending to Traccar: {data}")
     try:
-        resp = requests.get(PUSH_URL, params=data, timeout=10)  # ← GET non POST
+        resp = requests.get(PUSH_URL, params=data, timeout=10)
         print(f"[UploadLocation] Response: {resp.status_code}")
     except Exception as e:
         print(f"[UploadLocation] Error: {e}")
